@@ -6,6 +6,8 @@ use bevy::{prelude::PluginGroup, app::PluginGroupBuilder};
 pub use bevy_animation::*;
 pub use bevy_gltf::*;
 
+pub mod quat_splines;
+
 pub struct MotionWarpPlugins;
 
 impl PluginGroup for MotionWarpPlugins {
