@@ -4,23 +4,25 @@
 use std::ops::Deref;
 use std::time::Duration;
 
-use bevy::app::{App, CoreSet, Plugin};
-use bevy::asset::{AddAsset, Assets, Handle};
+use bevy::asset::{Assets, Handle};
 use bevy::ecs::prelude::*;
 use bevy::core::Name;
 use bevy::hierarchy::{Children, Parent};
 use bevy::math::{Quat, Vec3};
 use bevy::reflect::{FromReflect, Reflect, TypeUuid};
 use bevy::time::Time;
-use bevy::transform::{prelude::Transform, TransformSystem};
+use bevy::transform::{prelude::Transform};
 use bevy::utils::{tracing::warn, HashMap};
+
+use crate::MotionWarpClip;
 
 #[allow(missing_docs)]
 pub mod prelude {
     #[doc(hidden)]
     pub use super::{
-        AnimationClip, AnimationPlayer, AnimationPlugin, EntityPath, Keyframes, VariableCurve,
+        AnimationClip, AnimationPlayer, EntityPath, Keyframes, VariableCurve,
     };
+    pub use crate::AnimationPlugin;
 }
 
 /// List of keyframes for one of the attribute of a [`Transform`].
@@ -104,6 +106,52 @@ impl AnimationClip {
             self.paths.insert(path, idx);
         }
     }
+
+    /// The rotation at an entity path at an elapsed time, assuming no transitions are occuring.
+    /// 
+    /// Calculates rotation in the same way as [apply_animation].
+    pub fn get_joint_rotation_at(&self, path: &EntityPath, elapsed: f32) -> Quat {
+        let Some(bone_id) = self.paths.get(path) else {
+            warn!("Couldn't find bone id for {:?}. Returning identity quat.", path);
+            return Quat::IDENTITY;
+        };
+        let curves = self.get_curves(*bone_id).unwrap();
+
+        let mut rot = Quat::IDENTITY;
+
+        for curve in curves {
+            if curve.keyframe_timestamps.len() == 1 {
+                if let Keyframes::Rotation(keyframes) = &curve.keyframes {
+                    rot = keyframes[0];
+                } 
+                continue; 
+            }
+
+            let step_start = match curve
+                .keyframe_timestamps
+                .binary_search_by(|probe| probe.partial_cmp(&elapsed).unwrap())
+            {
+                Ok(n) if n >= curve.keyframe_timestamps.len() - 1 => continue, // this curve is finished
+                Ok(i) => i,
+                Err(0) => continue, // this curve isn't started yet
+                Err(n) if n > curve.keyframe_timestamps.len() - 1 => continue, // this curve is finished
+                Err(i) => i - 1,
+            };
+            let ts_start = curve.keyframe_timestamps[step_start];
+            let ts_end = curve.keyframe_timestamps[step_start + 1];
+            let lerp = (elapsed - ts_start) / (ts_end - ts_start);
+
+            if let Keyframes::Rotation(keyframes) = &curve.keyframes {
+                let rot_start = keyframes[step_start];
+                let mut rot_end = keyframes[step_start + 1];
+                if rot_end.dot(rot_start) < 0.0 {
+                    rot_end = -rot_end;
+                }
+                rot = rot_start.normalize().slerp(rot_end.normalize(), lerp);
+            }
+        }
+        rot
+    }
 }
 
 #[derive(Reflect)]
@@ -113,6 +161,8 @@ struct PlayingAnimation {
     elapsed: f32,
     animation_clip: Handle<AnimationClip>,
     path_cache: Vec<Vec<Option<Entity>>>,
+    #[reflect(ignore)]
+    warp_clip: Option<Handle<MotionWarpClip>>
 }
 
 impl Default for PlayingAnimation {
@@ -123,6 +173,7 @@ impl Default for PlayingAnimation {
             elapsed: 0.0,
             animation_clip: Default::default(),
             path_cache: Vec::new(),
+            warp_clip: None,
         }
     }
 }
@@ -266,6 +317,28 @@ impl AnimationPlayer {
         self.animation.elapsed = elapsed;
         self
     }
+
+    /// Current animation clip
+    pub fn animation_clip(&self) -> &Handle<AnimationClip> {
+        &self.animation.animation_clip
+    }
+
+    /// Start warping an animation
+    pub fn play_warp(&mut self, handle: Handle<MotionWarpClip>) -> &mut Self {
+        self.animation.warp_clip = Some(handle);
+        self
+    }
+
+    /// Stops warping an animation
+    pub fn stop_warp(&mut self) -> &mut Self {
+        self.animation.warp_clip = None;
+        self
+    }
+
+    /// Is the current animation being motion warped?
+    pub fn is_warped(&self) -> bool {
+        self.animation.warp_clip.is_some()
+    }
 }
 
 fn find_bone(
@@ -337,6 +410,7 @@ fn verify_no_ancestor_player(
 pub fn animation_player(
     time: Res<Time>,
     animations: Res<Assets<AnimationClip>>,
+    motion_warps: Res<Assets<MotionWarpClip>>,
     children: Query<&Children>,
     names: Query<&Name>,
     transforms: Query<&mut Transform>,
@@ -352,6 +426,7 @@ pub fn animation_player(
                 player,
                 &time,
                 &animations,
+                &motion_warps,
                 &names,
                 &transforms,
                 maybe_parent,
@@ -367,6 +442,7 @@ fn run_animation_player(
     mut player: Mut<AnimationPlayer>,
     time: &Time,
     animations: &Assets<AnimationClip>,
+    motion_warps: &Assets<MotionWarpClip>,
     names: &Query<&Name>,
     transforms: &Query<&mut Transform>,
     maybe_parent: Option<&Parent>,
@@ -380,6 +456,17 @@ fn run_animation_player(
         return;
     }
 
+    let warp = 
+        if let Some(handle) = &player.animation.warp_clip {
+            if let Some(warp_clip) = motion_warps.get(handle) {
+                Some(warp_clip)
+            }
+            else {
+                None
+            }
+        }
+        else { None };
+
     // Apply the main animation
     apply_animation(
         1.0,
@@ -388,12 +475,15 @@ fn run_animation_player(
         root,
         time,
         animations,
+        warp,
         names,
         transforms,
         maybe_parent,
         parents,
         children,
     );
+    
+    
 
     // Apply any potential fade-out transitions from previous animations
     for AnimationTransition {
@@ -409,6 +499,7 @@ fn run_animation_player(
             root,
             time,
             animations,
+            None,
             names,
             transforms,
             maybe_parent,
@@ -426,6 +517,7 @@ fn apply_animation(
     root: Entity,
     time: &Time,
     animations: &Assets<AnimationClip>,
+    motion_warp: Option<&MotionWarpClip>,
     names: &Query<&Name>,
     transforms: &Query<&mut Transform>,
     maybe_parent: Option<&Parent>,
@@ -437,6 +529,7 @@ fn apply_animation(
             animation.elapsed += time.delta_seconds() * animation.speed;
         }
         let mut elapsed = animation.elapsed;
+        // TODO: warp time HERE
         if animation.repeat {
             elapsed %= animation_clip.duration;
         }
@@ -450,7 +543,6 @@ fn apply_animation(
             warn!("Animation player on {:?} has a conflicting animation player on an ancestor. Cannot safely animate.", root);
             return;
         }
-
         for (path, bone_id) in &animation_clip.paths {
             let cached_path = &mut animation.path_cache[*bone_id];
             let curves = animation_clip.get_curves(*bone_id).unwrap();
@@ -473,7 +565,21 @@ fn apply_animation(
                 if curve.keyframe_timestamps.len() == 1 {
                     match &curve.keyframes {
                         Keyframes::Rotation(keyframes) => {
-                            transform.rotation = transform.rotation.slerp(keyframes[0], weight);
+                            
+                            let theta = keyframes[0];
+                            if let Some(warp_clip) = motion_warp {
+                                if warp_clip.start_time <= elapsed && elapsed <= warp_clip.end_time {
+                                    if let Some(warp_id) = warp_clip.paths.get(path) {
+                                        if let Some(warp_curve) = warp_clip.curves.get(*warp_id) {
+                                            transform.rotation = warp_clip.theta_blend(warp_curve, elapsed, theta);
+                                            continue;
+                                        };
+                                    }
+                                }
+                            }
+                            
+                            transform.rotation = transform.rotation.slerp(theta, weight);
+                            
                         }
                         Keyframes::Translation(keyframes) => {
                             transform.translation =
@@ -512,8 +618,21 @@ fn apply_animation(
                             rot_end = -rot_end;
                         }
                         // Rotations are using a spherical linear interpolation
-                        let rot = rot_start.normalize().slerp(rot_end.normalize(), lerp);
-                        transform.rotation = transform.rotation.slerp(rot, weight);
+                        let theta = rot_start.normalize().slerp(rot_end.normalize(), lerp);
+
+                        if let Some(warp_clip) = motion_warp {
+                            if warp_clip.start_time <= elapsed && elapsed <= warp_clip.end_time {
+                                if let Some(warp_id) = warp_clip.paths.get(path) {
+                                    if let Some(warp_curve) = warp_clip.curves.get(*warp_id) {
+                                        transform.rotation = warp_clip.theta_blend(warp_curve, elapsed, theta);
+                                        continue;
+                                    };
+                                }
+                            }   
+                        }
+                        
+                        transform.rotation = transform.rotation.slerp(theta, weight);
+                        
                     }
                     Keyframes::Translation(keyframes) => {
                         let translation_start = keyframes[step_start];
@@ -540,19 +659,3 @@ fn update_transitions(player: &mut AnimationPlayer, time: &Time) {
     });
 }
 
-/// Adds animation support to an app
-#[derive(Default)]
-pub struct AnimationPlugin {}
-
-impl Plugin for AnimationPlugin {
-    fn build(&self, app: &mut App) {
-        app.add_asset::<AnimationClip>()
-            .register_asset_reflect::<AnimationClip>()
-            .register_type::<AnimationPlayer>()
-            .add_system(
-                animation_player
-                    .in_base_set(CoreSet::PostUpdate)
-                    .before(TransformSystem::TransformPropagate),
-            );
-    }
-}
